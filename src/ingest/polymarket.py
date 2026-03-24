@@ -85,6 +85,10 @@ def _parse_json_like_list(value: Any) -> list[Any]:
         return []
     if isinstance(value, list):
         return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, dict):
+        return []
     if isinstance(value, str):
         stripped = value.strip()
         if not stripped:
@@ -93,7 +97,11 @@ def _parse_json_like_list(value: Any) -> list[Any]:
             parsed = json.loads(stripped)
         except json.JSONDecodeError:
             return [item.strip() for item in stripped.split(",") if item.strip()]
-        return parsed if isinstance(parsed, list) else []
+        if isinstance(parsed, list):
+            return parsed
+        if isinstance(parsed, tuple):
+            return list(parsed)
+        return []
     return []
 
 
@@ -128,7 +136,15 @@ def _normalize_outcome_prices(value: Any) -> list[float]:
     """Return numeric outcome prices from a market payload."""
 
     parsed = _parse_json_like_list(value)
-    return [price for price in (_coerce_float(item) for item in parsed) if price is not None]
+    normalized: list[float] = []
+    for item in parsed:
+        if isinstance(item, dict):
+            numeric = _coerce_float(item.get("price"))
+        else:
+            numeric = _coerce_float(item)
+        if numeric is not None:
+            normalized.append(min(max(numeric, 0.0), 1.0))
+    return normalized
 
 
 def _extract_implied_probability(outcomes: Any, outcome_prices: Any) -> float | None:
@@ -147,9 +163,9 @@ def _extract_implied_probability(outcomes: Any, outcome_prices: Any) -> float | 
 
     for index, label in enumerate(labels):
         if label.lower() == "yes" and index < len(prices):
-            return prices[index]
+            return min(max(prices[index], 0.0), 1.0)
 
-    return prices[0]
+    return min(max(prices[0], 0.0), 1.0)
 
 
 def _extract_category(event: dict[str, Any], market: dict[str, Any]) -> str | None:
@@ -206,10 +222,31 @@ def normalize_events_payload(events: list[dict[str, Any]]) -> pd.DataFrame:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
     frame = frame.drop_duplicates(subset=["market_id"]).reset_index(drop=True)
-    frame["implied_prob"] = pd.to_numeric(frame["implied_prob"], errors="coerce")
+    frame["implied_prob"] = pd.to_numeric(frame["implied_prob"], errors="coerce").clip(lower=0.0, upper=1.0)
     frame["active"] = frame["active"].astype(bool)
     frame["closed"] = frame["closed"].astype(bool)
     return frame[OUTPUT_COLUMNS]
+
+
+def select_normalized_columns(markets: pd.DataFrame) -> pd.DataFrame:
+    """Return only the normalized downstream columns in a stable order."""
+
+    normalized = markets.copy()
+    for column in OUTPUT_COLUMNS:
+        if column not in normalized.columns:
+            normalized[column] = pd.NA
+
+    if "implied_prob" in normalized.columns:
+        normalized["implied_prob"] = pd.to_numeric(normalized["implied_prob"], errors="coerce").clip(
+            lower=0.0,
+            upper=1.0,
+        )
+    if "active" in normalized.columns:
+        normalized["active"] = normalized["active"].fillna(False).astype(bool)
+    if "closed" in normalized.columns:
+        normalized["closed"] = normalized["closed"].fillna(False).astype(bool)
+
+    return normalized.loc[:, OUTPUT_COLUMNS].copy()
 
 
 def _raise_for_bad_response(response: Response) -> None:
@@ -311,7 +348,7 @@ def fetch_active_markets_dataframe(
     """Fetch active Polymarket markets and return a normalized DataFrame."""
 
     events = fetch_active_events(config=config, session=session, max_pages=max_pages)
-    return normalize_events_payload(events)
+    return select_normalized_columns(normalize_events_payload(events))
 
 
 def filter_low_probability_markets(
@@ -335,6 +372,34 @@ def filter_low_probability_markets(
     return filtered.sort_values(by="implied_prob", ascending=True).reset_index(drop=True)
 
 
+def format_summary(markets: pd.DataFrame, low_probability_markets: pd.DataFrame) -> str:
+    """Build a concise printable summary for quick manual validation."""
+
+    head_text = markets.head(5).to_string(index=False)
+    return "\n".join(
+        [
+            f"total markets fetched: {len(markets)}",
+            f"columns: {list(markets.columns)}",
+            "head(5):",
+            head_text,
+            f"low-probability count: {len(low_probability_markets)}",
+        ]
+    )
+
+
+def main() -> None:
+    """Run a simple Polymarket fetch and print a concise summary."""
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
+    markets = fetch_active_markets_dataframe(max_pages=1)
+    low_probability_markets = filter_low_probability_markets(markets)
+    print(format_summary(markets, low_probability_markets))
+
+
+if __name__ == "__main__":
+    main()
+
+
 __all__ = [
     "BASE_URL",
     "OUTPUT_COLUMNS",
@@ -345,6 +410,8 @@ __all__ = [
     "fetch_active_events_page",
     "fetch_active_markets_dataframe",
     "filter_low_probability_markets",
+    "format_summary",
     "normalize_events_payload",
     "normalize_market_record",
+    "select_normalized_columns",
 ]
