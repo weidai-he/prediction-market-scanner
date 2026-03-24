@@ -159,8 +159,82 @@ def dataframe_to_market_records(
     ]
 
 
+def validate_market_dataframe(
+    frame: pd.DataFrame,
+    *,
+    logger: Any | None = None,
+    source_platform: str | None = None,
+) -> pd.DataFrame:
+    """Remove rows missing critical fields and log dropped records."""
+
+    if frame.empty:
+        return frame.copy()
+
+    validated = frame.copy()
+
+    if "title" not in validated.columns and "question" in validated.columns:
+        validated["title"] = validated["question"]
+    if "close_time" not in validated.columns:
+        for alias in ("market_close_time", "end_date"):
+            if alias in validated.columns:
+                validated["close_time"] = validated[alias]
+                break
+    if "market_prob" not in validated.columns and "implied_prob" in validated.columns:
+        validated["market_prob"] = pd.to_numeric(validated["implied_prob"], errors="coerce")
+    else:
+        validated["market_prob"] = pd.to_numeric(validated.get("market_prob"), errors="coerce")
+
+    market_id_series = (
+        validated["market_id"]
+        if "market_id" in validated.columns
+        else pd.Series(pd.NA, index=validated.index)
+    )
+    title_series = (
+        validated["title"]
+        if "title" in validated.columns
+        else pd.Series(pd.NA, index=validated.index)
+    )
+    category_series = (
+        validated["category"]
+        if "category" in validated.columns
+        else pd.Series(pd.NA, index=validated.index)
+    )
+    close_time_series = (
+        validated["close_time"]
+        if "close_time" in validated.columns
+        else pd.Series(pd.NA, index=validated.index)
+    )
+
+    required_mask = (
+        market_id_series.notna()
+        & title_series.notna()
+        & category_series.notna()
+        & close_time_series.notna()
+        & validated["market_prob"].notna()
+        & validated["market_prob"].between(0.0, 1.0, inclusive="both")
+        & validated["market_prob"].gt(0.0)
+    )
+
+    dropped = validated.loc[~required_mask].copy()
+    if logger is not None and not dropped.empty:
+        platform = source_platform or "unknown"
+        for _, row in dropped.iterrows():
+            logger.warning(
+                "Dropping invalid %s row market_id=%s title=%s category=%s close_time=%s market_prob=%s",
+                platform,
+                row.get("market_id"),
+                row.get("title") or row.get("question"),
+                row.get("category"),
+                row.get("close_time"),
+                row.get("market_prob"),
+            )
+
+    return validated.loc[required_mask].reset_index(drop=True)
+
+
 __all__ = [
     "NormalizedMarketRecord",
     "dataframe_to_market_records",
+    "validate_market_dataframe",
     "row_to_market_record",
 ]

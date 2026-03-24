@@ -17,6 +17,8 @@ from requests import Response, Session
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from ingest.schema import validate_market_dataframe
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -143,6 +145,8 @@ def _normalize_outcome_prices(value: Any) -> list[float]:
         else:
             numeric = _coerce_float(item)
         if numeric is not None:
+            if numeric > 1.0:
+                numeric = numeric / 100.0
             normalized.append(min(max(numeric, 0.0), 1.0))
     return normalized
 
@@ -171,7 +175,37 @@ def _extract_implied_probability(outcomes: Any, outcome_prices: Any) -> float | 
 def _extract_category(event: dict[str, Any], market: dict[str, Any]) -> str | None:
     """Resolve the best available category for a market record."""
 
-    for candidate in (market.get("category"), event.get("category")):
+    for candidate in (market.get("category"), event.get("category"), event.get("tags"), market.get("tags")):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+        if isinstance(candidate, list):
+            values = [str(item).strip() for item in candidate if str(item).strip()]
+            if values:
+                return values[0]
+    return None
+
+
+def _extract_market_title(event: dict[str, Any], market: dict[str, Any]) -> str | None:
+    """Resolve the most useful market title for downstream display."""
+
+    for candidate in (market.get("question"), market.get("title"), event.get("title"), event.get("question")):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _extract_close_time(event: dict[str, Any], market: dict[str, Any]) -> str | None:
+    """Resolve close time from the best available event or market field."""
+
+    for candidate in (
+        market.get("endDate"),
+        market.get("end_date_iso"),
+        market.get("expirationDate"),
+        event.get("endDate"),
+        event.get("end_date_iso"),
+        event.get("expirationDate"),
+        event.get("startDate"),
+    ):
         if isinstance(candidate, str) and candidate.strip():
             return candidate.strip()
     return None
@@ -188,14 +222,17 @@ def normalize_market_record(event: dict[str, Any], market: dict[str, Any]) -> di
 
     return {
         "market_id": str(market.get("id") or market.get("conditionId") or ""),
-        "question": market.get("question"),
-        "event_title": event.get("title"),
-        "end_date": market.get("endDate") or event.get("endDate"),
+        "question": _extract_market_title(event=event, market=market),
+        "title": _extract_market_title(event=event, market=market),
+        "event_title": _extract_market_title(event=event, market=event),
+        "end_date": _extract_close_time(event=event, market=market),
+        "close_time": _extract_close_time(event=event, market=market),
         "category": _extract_category(event=event, market=market),
         "outcome_prices": outcome_prices,
         "implied_prob": implied_prob,
         "active": _coerce_bool(market.get("active", event.get("active"))),
         "closed": _coerce_bool(market.get("closed", event.get("closed"))),
+        "raw_json": {"event": event, "market": market},
     }
 
 
@@ -225,6 +262,7 @@ def normalize_events_payload(events: list[dict[str, Any]]) -> pd.DataFrame:
     frame["implied_prob"] = pd.to_numeric(frame["implied_prob"], errors="coerce").clip(lower=0.0, upper=1.0)
     frame["active"] = frame["active"].astype(bool)
     frame["closed"] = frame["closed"].astype(bool)
+    frame = validate_market_dataframe(frame, logger=LOGGER, source_platform="polymarket")
     return frame[OUTPUT_COLUMNS]
 
 
@@ -246,6 +284,7 @@ def select_normalized_columns(markets: pd.DataFrame) -> pd.DataFrame:
     if "closed" in normalized.columns:
         normalized["closed"] = normalized["closed"].fillna(False).astype(bool)
 
+    normalized = validate_market_dataframe(normalized, logger=LOGGER, source_platform="polymarket")
     return normalized.loc[:, OUTPUT_COLUMNS].copy()
 
 

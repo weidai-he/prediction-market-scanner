@@ -17,6 +17,8 @@ from requests import Response, Session
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from ingest.schema import validate_market_dataframe
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -139,6 +141,7 @@ def _extract_category(market: dict[str, Any]) -> str | None:
     for candidate in (
         market.get("category"),
         market.get("event", {}).get("category") if isinstance(market.get("event"), dict) else None,
+        market.get("event", {}).get("series_category") if isinstance(market.get("event"), dict) else None,
         market.get("series_ticker"),
     ):
         if isinstance(candidate, str) and candidate.strip():
@@ -156,6 +159,34 @@ def _extract_event_title(market: dict[str, Any]) -> str | None:
                 return candidate.strip()
 
     for candidate in (market.get("event_title"), market.get("subtitle"), market.get("title")):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _extract_market_title(market: dict[str, Any]) -> str | None:
+    """Resolve the best available market title."""
+
+    for candidate in (
+        market.get("title"),
+        market.get("question"),
+        market.get("yes_sub_title"),
+        _extract_event_title(market),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _extract_close_time(market: dict[str, Any]) -> str | None:
+    """Resolve the best available close time."""
+
+    for candidate in (
+        market.get("close_time"),
+        market.get("expiration_time"),
+        market.get("end_date"),
+        market.get("event", {}).get("close_time") if isinstance(market.get("event"), dict) else None,
+    ):
         if isinstance(candidate, str) and candidate.strip():
             return candidate.strip()
     return None
@@ -194,9 +225,11 @@ def normalize_market_record(market: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "market_id": str(market.get("ticker") or market.get("market_ticker") or ""),
-        "question": market.get("title"),
+        "question": _extract_market_title(market),
+        "title": _extract_market_title(market),
         "event_title": _extract_event_title(market),
-        "end_date": market.get("close_time") or market.get("expiration_time"),
+        "end_date": _extract_close_time(market),
+        "close_time": _extract_close_time(market),
         "category": _extract_category(market),
         "outcome_prices": outcome_prices,
         "implied_prob": _clip_probability(implied_prob),
@@ -205,7 +238,8 @@ def normalize_market_record(market: dict[str, Any]) -> dict[str, Any]:
         "bid": bid,
         "ask": ask,
         "last_price": last_price,
-        "market_close_time": market.get("close_time") or market.get("expiration_time"),
+        "market_close_time": _extract_close_time(market),
+        "raw_json": market,
     }
 
 
@@ -223,6 +257,7 @@ def select_normalized_columns(markets: pd.DataFrame) -> pd.DataFrame:
     normalized["active"] = normalized["active"].fillna(False).astype(bool)
     normalized["closed"] = normalized["closed"].fillna(False).astype(bool)
 
+    normalized = validate_market_dataframe(normalized, logger=LOGGER, source_platform="kalshi")
     return normalized.loc[:, OUTPUT_COLUMNS].copy()
 
 
@@ -244,7 +279,8 @@ def normalize_markets_payload(markets: list[dict[str, Any]]) -> pd.DataFrame:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
     frame = frame.drop_duplicates(subset=["market_id"]).reset_index(drop=True)
-    return select_normalized_columns(frame)
+    frame = select_normalized_columns(frame)
+    return validate_market_dataframe(frame, logger=LOGGER, source_platform="kalshi")
 
 
 def _raise_for_bad_response(response: Response) -> None:

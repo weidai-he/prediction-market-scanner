@@ -23,6 +23,12 @@ from backtest.runner import BacktestConfig, get_equity_curve, run_backtest
 from ingest.kalshi import fetch_markets_dataframe as fetch_kalshi_markets
 from ingest.polymarket import fetch_active_markets_dataframe as fetch_polymarket_markets
 from models.edge_score import rank_low_probability_opportunities
+from models.market_universe import (
+    UNIVERSE_OPTIONS,
+    build_market_explanation,
+    classify_market_subtype,
+    filter_market_universe,
+)
 
 
 st.set_page_config(
@@ -85,11 +91,30 @@ def ensure_opportunity_columns(markets: pd.DataFrame) -> pd.DataFrame:
     if "title" not in normalized.columns:
         if "question" in normalized.columns:
             normalized["title"] = normalized["question"]
+        elif "event_title" in normalized.columns:
+            normalized["title"] = normalized["event_title"]
         else:
-            normalized["title"] = normalized.get("market_id", "Untitled market")
+            normalized["title"] = (
+                normalized["market_id"].astype(str)
+                if "market_id" in normalized.columns
+                else pd.Series("Untitled market", index=normalized.index)
+            )
+    else:
+        question_fallback = normalized["question"] if "question" in normalized.columns else pd.Series(pd.NA, index=normalized.index)
+        normalized["title"] = normalized["title"].fillna(question_fallback)
+        if "event_title" in normalized.columns:
+            normalized["title"] = normalized["title"].fillna(normalized["event_title"])
+        market_id_fallback = (
+            normalized["market_id"].astype(str)
+            if "market_id" in normalized.columns
+            else pd.Series("Untitled market", index=normalized.index)
+        )
+        normalized["title"] = normalized["title"].fillna(market_id_fallback)
 
     if "category" not in normalized.columns:
         normalized["category"] = "uncategorized"
+    else:
+        normalized["category"] = normalized["category"].fillna("uncategorized")
 
     if "market_prob" not in normalized.columns:
         if "implied_prob" in normalized.columns:
@@ -104,6 +129,11 @@ def ensure_opportunity_columns(markets: pd.DataFrame) -> pd.DataFrame:
             normalized["close_time"] = normalized["end_date"]
         else:
             normalized["close_time"] = pd.NaT
+    else:
+        if "market_close_time" in normalized.columns:
+            normalized["close_time"] = normalized["close_time"].fillna(normalized["market_close_time"])
+        if "end_date" in normalized.columns:
+            normalized["close_time"] = normalized["close_time"].fillna(normalized["end_date"])
 
     for column in ("market_prob", "bid", "ask", "last", "liquidity"):
         if column in normalized.columns:
@@ -111,10 +141,16 @@ def ensure_opportunity_columns(markets: pd.DataFrame) -> pd.DataFrame:
         else:
             normalized[column] = pd.NA
 
+    normalized["market_prob"] = normalized["market_prob"].where(normalized["market_prob"].between(0.0, 1.0), pd.NA)
+    normalized = normalized.loc[normalized["market_prob"].notna() & normalized["market_prob"].gt(0.0)].copy()
+
     normalized["close_time"] = pd.to_datetime(normalized["close_time"], errors="coerce", utc=True)
     normalized["time_to_expiry_days"] = (
         (normalized["close_time"] - pd.Timestamp.now(tz="UTC")).dt.total_seconds() / 86400.0
     ).clip(lower=0.0)
+    normalized = normalized.loc[
+        normalized["close_time"].notna() & normalized["title"].notna() & normalized["category"].notna()
+    ].copy()
 
     if "model_prob" not in normalized.columns:
         # Demo-only model estimate so the dashboard can rank live markets before
@@ -202,15 +238,6 @@ def apply_market_filters(markets: pd.DataFrame) -> pd.DataFrame:
     if selected_platforms:
         filtered = filtered.loc[filtered["source_platform"].isin(selected_platforms)]
 
-    categories = sorted(category for category in filtered["category"].dropna().astype(str).unique())
-    selected_categories = st.sidebar.multiselect(
-        "Category",
-        options=categories,
-        default=categories,
-    )
-    if selected_categories:
-        filtered = filtered.loc[filtered["category"].astype(str).isin(selected_categories)]
-
     min_prob = float(filtered["market_prob"].fillna(0.0).min()) if not filtered.empty else 0.0
     max_prob = float(filtered["market_prob"].fillna(0.0).max()) if not filtered.empty else 1.0
     prob_range = st.sidebar.slider(
@@ -245,6 +272,57 @@ def render_summary_cards(summary: dict[str, float | int]) -> None:
     card_columns[3].metric("Avg Edge", f"{summary.get('average_edge', 0.0):.3f}")
     card_columns[4].metric("Max Drawdown", f"{summary.get('max_drawdown', 0.0):.2f}")
     st.caption(f"Brier score: {summary.get('brier_score', 0.0):.4f} | Total PnL: {summary.get('total_pnl', 0.0):.2f}")
+
+
+def _format_probability(value: object) -> str:
+    """Format a probability-like value as a percentage string."""
+
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric):
+        return "N/A"
+    return f"{float(numeric):.1%}"
+
+
+def build_recommendation(row: pd.Series) -> str:
+    """Return a simple recommendation based on model and market probabilities."""
+
+    market_prob = pd.to_numeric(pd.Series([row.get("market_prob")]), errors="coerce").iloc[0]
+    model_prob = pd.to_numeric(pd.Series([row.get("model_prob")]), errors="coerce").iloc[0]
+
+    if pd.isna(market_prob) or pd.isna(model_prob):
+        return "Avoid until pricing confidence improves"
+    if model_prob > market_prob:
+        return f"Buy YES under {market_prob:.1%}"
+    return "Avoid"
+
+
+def render_top_opportunity_card(opportunities: pd.DataFrame) -> None:
+    """Render a visually distinct top-opportunity card."""
+
+    st.subheader("Top Opportunity Today")
+
+    if opportunities.empty:
+        st.info("No ranked opportunity is available right now. Adjust filters or fall back to synthetic demo data.")
+        return
+
+    top_row = opportunities.iloc[0]
+    title = top_row.get("title") or top_row.get("market_id") or "Untitled market"
+
+    with st.container(border=True):
+        st.markdown(f"### {title}")
+        metric_columns = st.columns(4)
+        metric_columns[0].metric("Market Prob", _format_probability(top_row.get("market_prob")))
+        metric_columns[1].metric("Model Prob", _format_probability(top_row.get("model_prob")))
+        metric_columns[2].metric("Edge", _format_probability(top_row.get("edge")))
+        metric_columns[3].metric("Subtype", str(top_row.get("market_subtype") or "other"))
+
+        st.caption(f"Platform: {str(top_row.get('source_platform') or 'unknown')}")
+
+        st.markdown("**Why mispriced**")
+        st.write(build_market_explanation(top_row))
+
+        st.markdown("**Recommendation**")
+        st.write(build_recommendation(top_row))
 
 
 def render_opportunity_chart(opportunities: pd.DataFrame) -> None:
@@ -301,41 +379,69 @@ def main() -> None:
     else:
         opportunity_universe = live_markets
 
-    filtered_universe = apply_market_filters(opportunity_universe)
-    ranked_opportunities = rank_low_probability_opportunities(
-        filtered_universe,
-        model_prob_column="model_prob",
-        market_prob_column="market_prob",
-        min_market_prob=0.0,
-        max_market_prob=1.0,
-    )
+    st.sidebar.header("Universe")
+    selected_universe = st.sidebar.selectbox("Market Universe", options=UNIVERSE_OPTIONS, index=1)
+    show_filter_debug = st.sidebar.checkbox("Show filter debug", value=False)
+
+    before_universe_count = len(opportunity_universe)
+    universe_constrained = filter_market_universe(opportunity_universe, universe=selected_universe)
+    after_universe_count = len(universe_constrained)
+    filtered_universe = apply_market_filters(universe_constrained)
+
+    if filtered_universe.empty:
+        ranked_opportunities = filtered_universe.copy()
+    else:
+        ranked_opportunities = rank_low_probability_opportunities(
+            filtered_universe,
+            model_prob_column="model_prob",
+            market_prob_column="market_prob",
+            min_market_prob=0.0,
+            max_market_prob=1.0,
+        )
+        ranked_opportunities["market_subtype"] = ranked_opportunities.apply(classify_market_subtype, axis=1)
+        ranked_opportunities["explanation"] = ranked_opportunities.apply(build_market_explanation, axis=1)
 
     top_opportunities = ranked_opportunities.head(25).copy()
     if not top_opportunities.empty:
         top_opportunities["close_time"] = pd.to_datetime(top_opportunities["close_time"], errors="coerce", utc=True)
         top_opportunities["close_time"] = top_opportunities["close_time"].dt.strftime("%Y-%m-%d")
 
+    render_top_opportunity_card(ranked_opportunities)
+
     st.subheader("Top Opportunities")
     if top_opportunities.empty:
-        st.info("No markets match the current filters. Widen the filters or use synthetic data.")
+        st.info(f"No {selected_universe.lower()} markets match the current filters.")
     else:
         st.dataframe(
             top_opportunities[
                 [
                     "source_platform",
-                    "category",
+                    "market_subtype",
                     "market_id",
                     "title",
                     "market_prob",
                     "model_prob",
                     "edge",
                     "opportunity_score",
+                    "explanation",
                     "close_time",
                 ]
             ],
             use_container_width=True,
             hide_index=True,
         )
+
+    if show_filter_debug:
+        st.subheader("Filter Debug")
+        debug_columns = st.columns(2)
+        debug_columns[0].metric("Rows Before Universe Filter", before_universe_count)
+        debug_columns[1].metric("Rows After Universe Filter", after_universe_count)
+        sample_titles = universe_constrained.get("title", pd.Series(dtype=str)).dropna().astype(str).head(10)
+        if sample_titles.empty:
+            st.caption("No matched titles available for the current universe.")
+        else:
+            st.caption("Sample matched titles")
+            st.write(sample_titles.tolist())
 
     chart_col, summary_col = st.columns([1.4, 1.0])
     with chart_col:
