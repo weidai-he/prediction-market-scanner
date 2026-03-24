@@ -13,7 +13,7 @@ Low-probability event markets are noisy, thinly traded, and easy to overlook. Th
 - rank opportunities with transparent logic
 - replay threshold-based strategies before touching anything live
 
-The first domain focus here is weather-linked binary events, but the architecture is intentionally broader than weather alone.
+The first domain focus here is weather-linked binary events
 
 ## Architecture
 
